@@ -12,7 +12,7 @@ import uuid
 import firebase_admin
 from firebase_admin import credentials, storage
 
-# Firebase 초기화 (한 번만 실행됨)
+# ✅ Firebase 초기화
 cred = credentials.Certificate("giftoyou-ad070-firebase-adminsdk-fbsvc-6aa9b1ca63.json")
 firebase_admin.initialize_app(cred, {
     'storageBucket': 'giftoyou-ad070.firebasestorage.app'
@@ -23,12 +23,12 @@ print("✅ 현재 연결된 버킷 이름:", bucket.name)
 
 app = Flask(__name__)
 
-# ✅ 기존 이미지가 존재하는지 확인하는 함수
+# ✅ 기존 이미지 존재 확인
 def check_existing_images(username):
     blobs = list(bucket.list_blobs(prefix=f"insta_images/{username}/"))
     return [blob.public_url for blob in blobs if blob.name.endswith(('.jpg', '.jpeg', '.png'))]
 
-# ✅ Instagram 이미지 크롤링 함수
+# ✅ Instagram 이미지 크롤링
 def crawl_instagram_images(username):
     url = f"https://www.instagram.com/{username}/"
     options = webdriver.ChromeOptions()
@@ -41,7 +41,7 @@ def crawl_instagram_images(username):
 
     try:
         close_button = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, 'svg[aria-label="감지"]'))
+            EC.element_to_be_clickable((By.CSS_SELECTOR, 'svg[aria-label="감지"]'))  # 필요 시 '닫기'로 변경
         )
         close_button.click()
         print("팝업 닫기 완료")
@@ -62,7 +62,7 @@ def crawl_instagram_images(username):
 
     return selected
 
-# ✅ Firebase Storage에 이미지 업로드 함수
+# ✅ Firebase 업로드
 def upload_images_to_firebase(image_urls, username):
     uploaded_urls = []
 
@@ -87,17 +87,18 @@ def upload_images_to_firebase(image_urls, username):
     print(f"📦 최종 업로드된 이미지 수: {len(uploaded_urls)}")
     return uploaded_urls
 
-# ✅ API 엔드포인트
+# ✅ 기존 또는 신규 이미지 반환
 def get_firebase_or_crawl(username):
-    # 1. 기존 이미지 확인
     existing = check_existing_images(username)
     if existing:
-        print(f"📄 기존 {len(existing)}개 이미지 발견, 크롤링 사용 사진")
-        return existing
-    # 2. 없으면 크롤링 + 업로드
+        print(f"📄 기존 이미지 {len(existing)}개 발견, 크롤링 생략")
+        return existing, "✅ 기존 이미지 사용 완료"
+    
     new_images = crawl_instagram_images(username)
-    return upload_images_to_firebase(new_images, username)
+    uploaded = upload_images_to_firebase(new_images, username)
+    return uploaded, "✅ 신규 이미지 업로드 완료"
 
+# ✅ API 엔드포인트
 @app.route('/crawl', methods=['GET'])
 def crawl():
     username = request.args.get('username')
@@ -105,11 +106,16 @@ def crawl():
         return jsonify({'error': 'username is required'}), 400
 
     try:
-        result_urls = get_firebase_or_crawl(username)
-        return jsonify({'username': username, 'images': result_urls})
+        result_urls, msg = get_firebase_or_crawl(username)
+        return jsonify({
+            'username': username,
+            'images': result_urls,
+            'message': msg
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# ✅ 루트
 @app.route('/')
 def index():
     return '📷 Welcome to Insta Crawler API! Use /crawl?username=your_id'
