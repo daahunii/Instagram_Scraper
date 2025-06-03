@@ -17,3 +17,6 @@ pip install requests beautifulsoup4 <br>
 pip install selenium <br>
 pip install webdriver-manager <br>
 pip install firebase-admin <br>
+
+## 5. 사용 완료 후 가상환경 종료
+deactivate
