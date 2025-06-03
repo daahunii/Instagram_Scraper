@@ -12,8 +12,8 @@ source venv/bin/activate  # zsh/bash
 . venv/bin/activate
 
 ## 4. 가상환경 안에서 flask 설치
-pip install flask
-pip install requests beautifulsoup4
-pip install selenium
-pip install webdriver-manager
-pip install firebase-admin
+pip install flask <br>
+pip install requests beautifulsoup4 <br>
+pip install selenium <br>
+pip install webdriver-manager <br>
+pip install firebase-admin <br>
