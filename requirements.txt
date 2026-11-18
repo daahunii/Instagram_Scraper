@@ -1,0 +1,4 @@
+Flask>=3.1.2,<4
+requests>=2.32.5,<3
+selenium>=4.27,<5
+firebase-admin>=7,<8

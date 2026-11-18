@@ -1,124 +1,117 @@
-from flask import Flask, request, jsonify
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
-import time
-import requests
-from io import BytesIO
+"""Giftoyou image API with environment-based Firebase configuration."""
+from datetime import timedelta
+from functools import lru_cache
+import hmac
+import os
 import uuid
-import firebase_admin
-from firebase_admin import credentials, storage
-
-# ✅ Firebase 초기화
-cred = credentials.Certificate("giftoyou-ad070-firebase-adminsdk-fbsvc-6aa9b1ca63.json")
-firebase_admin.initialize_app(cred, {
-    'storageBucket': 'giftoyou-ad070.firebasestorage.app'
-})
-
-bucket = storage.bucket()
-print("✅ 현재 연결된 버킷 이름:", bucket.name)
+import requests
+from flask import Flask, jsonify, request
+from insta_scraper import MAX_IMAGES, crawl_instagram_images, is_image_url, validate_username
 
 app = Flask(__name__)
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+IMAGE_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 
-# ✅ 기존 이미지 존재 확인
+
+@lru_cache(maxsize=1)
+def get_bucket():
+    import firebase_admin
+    from firebase_admin import storage
+    name = os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip()
+    if not name:
+        raise RuntimeError("FIREBASE_STORAGE_BUCKET is required")
+    # Application Default Credentials: no project-specific filename in source.
+    firebase_app = firebase_admin.initialize_app(options={"storageBucket": name}, name="instagram-scraper")
+    return storage.bucket(app=firebase_app)
+
+
+def image_url(blob):
+    # Existing public objects remain public; this does not alter their ACLs.
+    if os.environ.get("FIREBASE_PUBLIC_IMAGES") == "true":
+        return blob.public_url
+    return blob.generate_signed_url(version="v4", expiration=timedelta(minutes=15), method="GET")
+
+
 def check_existing_images(username):
-    blobs = list(bucket.list_blobs(prefix=f"insta_images/{username}/"))
-    return [blob.public_url for blob in blobs if blob.name.endswith(('.jpg', '.jpeg', '.png'))]
+    validate_username(username)
+    blobs = get_bucket().list_blobs(prefix=f"insta_images/{username}/", max_results=MAX_IMAGES)
+    return [image_url(blob) for blob in blobs
+            if blob.name.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))]
 
-# ✅ Instagram 이미지 크롤링
-def crawl_instagram_images(username):
-    url = f"https://www.instagram.com/{username}/"
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
 
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-    driver.get(url)
+def download_image(url):
+    if not is_image_url(url):
+        raise ValueError("Unsupported image URL")
+    with requests.get(url, timeout=(3.05, 10), stream=True, allow_redirects=False) as response:
+        if response.status_code != 200:
+            raise ValueError("Image download failed")
+        content_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if content_type not in IMAGE_TYPES:
+            raise ValueError("Unsupported image content type")
+        data = bytearray()
+        for chunk in response.iter_content(chunk_size=65536):
+            if len(data) + len(chunk) > MAX_IMAGE_BYTES:
+                raise ValueError("Image exceeds size limit")
+            data.extend(chunk)
+        if not data:
+            raise ValueError("Empty image")
+        return bytes(data), content_type
 
-    try:
-        close_button = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, 'svg[aria-label="감지"]'))  # 필요 시 '닫기'로 변경
-        )
-        close_button.click()
-        print("팝업 닫기 완료")
-    except Exception as e:
-        print("팝업이 없거나 닫기 실패:", e)
 
-    time.sleep(3)
-    images = driver.find_elements(By.CSS_SELECTOR, 'img')
-    image_urls = [img.get_attribute("src") for img in images if img.get_attribute("src")]
-    driver.quit()
-
-    if len(image_urls) >= 2:
-        selected = image_urls[1:10]
-        if len(selected) < 9 and len(selected) > 1:
-            selected = selected[:-1]
-    else:
-        selected = image_urls[:1]
-
-    return selected
-
-# ✅ Firebase 업로드
 def upload_images_to_firebase(image_urls, username):
-    uploaded_urls = []
+    validate_username(username)
+    uploaded = []
+    for url in list(dict.fromkeys(image_urls))[:MAX_IMAGES]:
+        data, content_type = download_image(url)
+        blob = get_bucket().blob(f"insta_images/{username}/{uuid.uuid4()}{IMAGE_TYPES[content_type]}")
+        blob.upload_from_string(data, content_type=content_type)
+        if os.environ.get("FIREBASE_PUBLIC_IMAGES") == "true":
+            blob.make_public()
+        uploaded.append(image_url(blob))
+    return uploaded
 
-    for idx, url in enumerate(image_urls):
-        print(f"▶️ 이미지 {idx+1}: {url}")
-        try:
-            response = requests.get(url)
-            if response.status_code == 200:
-                image_data = BytesIO(response.content)
-                filename = f"{username}_{uuid.uuid4()}.jpg"
-                blob = bucket.blob(f"insta_images/{username}/{filename}")
-                blob.upload_from_file(image_data, content_type='image/jpeg')
-                blob.make_public()
-                print(f"✅ 업로드 성공: {blob.public_url}")
-                uploaded_urls.append(blob.public_url)
-            else:
-                print(f"❌ 이미지 응답 오류: {response.status_code}")
-        except Exception as e:
-            print(f"❌ 업로드 실패: {e}")
-            continue
 
-    print(f"📦 최종 업로드된 이미지 수: {len(uploaded_urls)}")
-    return uploaded_urls
-
-# ✅ 기존 또는 신규 이미지 반환
 def get_firebase_or_crawl(username):
+    validate_username(username)
     existing = check_existing_images(username)
     if existing:
-        print(f"📄 기존 이미지 {len(existing)}개 발견, 크롤링 생략")
-        return existing, "✅ 기존 이미지 사용 완료"
-    
-    new_images = crawl_instagram_images(username)
-    uploaded = upload_images_to_firebase(new_images, username)
-    return uploaded, "✅ 신규 이미지 업로드 완료"
+        return existing, "Existing images reused"
+    images = crawl_instagram_images(username)
+    if not images:
+        raise RuntimeError("No accessible post images")
+    uploaded = upload_images_to_firebase(images, username)
+    return uploaded, "New images uploaded"
 
-# ✅ API 엔드포인트
-@app.route('/crawl', methods=['GET'])
+
+@app.before_request
+def authenticate():
+    token = os.environ.get("SCRAPER_API_TOKEN", "")
+    if token and request.path != "/":
+        supplied = request.headers.get("Authorization", "")
+        if not hmac.compare_digest(supplied.encode(), ("Bearer " + token).encode()):
+            return jsonify({"error": "Unauthorized"}), 401
+
+
+@app.route("/crawl", methods=["GET"])
 def crawl():
-    username = request.args.get('username')
-    if not username:
-        return jsonify({'error': 'username is required'}), 400
-
+    username = request.args.get("username")
     try:
-        result_urls, msg = get_firebase_or_crawl(username)
-        return jsonify({
-            'username': username,
-            'images': result_urls,
-            'message': msg
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        validate_username(username)
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+    try:
+        urls, message = get_firebase_or_crawl(username)
+        return jsonify({"username": username, "images": urls, "message": message})
+    except Exception:
+        # Do not return credential paths, signed URLs or provider details.
+        app.logger.error("Image collection or storage operation failed")
+        return jsonify({"error": "Image collection or storage unavailable"}), 502
 
-# ✅ 루트
-@app.route('/')
+
+@app.route("/")
 def index():
-    return '📷 Welcome to Insta Crawler API! Use /crawl?username=your_id'
+    return jsonify({"service": "Instagram image API", "endpoint": "GET /crawl?username=your_id"})
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=8080, debug=False)
